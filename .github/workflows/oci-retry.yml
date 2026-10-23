@@ -1,0 +1,37 @@
+# Retries the jellyfin-ampere Oracle stack every 10 min until the instance exists.
+# Secrets: OCI_USER, OCI_TENANCY, OCI_FINGERPRINT, OCI_KEY
+name: OCI Ampere retry
+on:
+  schedule: [{cron: "*/10 * * * *"}]
+  workflow_dispatch:
+permissions: {actions: write}
+concurrency: {group: oci-retry}
+jobs:
+  try:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    env:
+      STACK: ocid1.ormstack.oc1.us-sanjose-1.amaaaaaawnnnhgqaued3ua52mi7g2agjaz5jlfnyw2jvrec4uixzuzyxh44q
+      T: ${{ secrets.OCI_TENANCY }}
+      OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING: "True"
+      GH_TOKEN: ${{ github.token }}
+    steps:
+    - run: pip install -q oci-cli
+    - env: {U: "${{ secrets.OCI_USER }}", F: "${{ secrets.OCI_FINGERPRINT }}", K: "${{ secrets.OCI_KEY }}"}
+      run: |
+        mkdir -p ~/.oci; printf '%s\n' "$K" > ~/.oci/k.pem; chmod 600 ~/.oci/k.pem
+        printf '[DEFAULT]\nuser=%s\nfingerprint=%s\ntenancy=%s\nregion=us-sanjose-1\nkey_file=%s\n' "$U" "$F" "$T" ~/.oci/k.pem > ~/.oci/config
+        chmod 600 ~/.oci/config
+        oci iam availability-domain list -c "$T" >/dev/null || { echo "::error::Oracle rejected the API key - check the 4 secrets"; exit 1; }
+    - name: Done already?
+      run: |
+        n=$(oci compute instance list -c "$T" --all --display-name jellyfin --query "length(data[?\"lifecycle-state\"!='TERMINATED' && \"lifecycle-state\"!='TERMINATING'])" --raw-output)
+        if [ "${n:-0}" -gt 0 ]; then gh workflow disable "$GITHUB_WORKFLOW" -R "$GITHUB_REPOSITORY"; echo "::error::SUCCESS - Ampere instance exists! Workflow disabled."; exit 1; fi
+    - name: Try again
+      run: |
+        read -r id st <<<"$(oci resource-manager job list --stack-id "$STACK" --sort-by timeCreated --sort-order DESC --limit 1 --query 'data[0].[id,"lifecycle-state"]|join(`" "`,@)' --raw-output)"
+        echo "Last job: ${st:-none}"
+        case "$st" in ACCEPTED|IN_PROGRESS|CANCELING) exit 0;; FAILED)
+          l=$(oci resource-manager job get-job-logs-content --job-id "$id" --query data --raw-output)
+          grep -qi "capacity\|TooManyRequests" <<<"$l" || { echo "::error::Non-capacity failure:"; grep -i error <<<"$l" | tail -5; exit 1; };; esac
+        oci resource-manager job create-apply-job --stack-id "$STACK" --execution-plan-strategy AUTO_APPROVED --query data.id --raw-output
