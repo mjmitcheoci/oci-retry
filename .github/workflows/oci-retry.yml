@@ -1,5 +1,6 @@
-# Retries the jellyfin-ampere Oracle stack every 10 min until the instance exists.
-# Secrets: OCI_USER, OCI_TENANCY, OCI_FINGERPRINT, OCI_KEY
+# Retries the jellyfin-ampere Oracle stack until the instance exists.
+# Each run stays alive ~25 min and starts a new attempt as soon as the previous
+# one finishes (~every 2 min). Secrets: OCI_USER, OCI_TENANCY, OCI_FINGERPRINT, OCI_KEY
 name: OCI Ampere retry
 on:
   schedule: [{cron: "*/10 * * * *"}]
@@ -9,7 +10,7 @@ concurrency: {group: oci-retry}
 jobs:
   try:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 30
     env:
       STACK: ocid1.ormstack.oc1.us-sanjose-1.amaaaaaawnnnhgqaued3ua52mi7g2agjaz5jlfnyw2jvrec4uixzuzyxh44q
       T: ${{ secrets.OCI_TENANCY }}
@@ -23,15 +24,34 @@ jobs:
         printf '[DEFAULT]\nuser=%s\nfingerprint=%s\ntenancy=%s\nregion=us-sanjose-1\nkey_file=%s\n' "$U" "$F" "$T" ~/.oci/k.pem > ~/.oci/config
         chmod 600 ~/.oci/config
         oci iam availability-domain list -c "$T" >/dev/null || { echo "::error::Oracle rejected the API key - check the 4 secrets"; exit 1; }
-    - name: Done already?
+    - name: Keep trying (~25 min)
       run: |
-        n=$(oci compute instance list -c "$T" --all --display-name jellyfin --query "length(data[?\"lifecycle-state\"!='TERMINATED' && \"lifecycle-state\"!='TERMINATING'])" --raw-output)
-        if [ "${n:-0}" -gt 0 ]; then gh workflow disable "$GITHUB_WORKFLOW" -R "$GITHUB_REPOSITORY"; echo "::error::SUCCESS - Ampere instance exists! Workflow disabled."; exit 1; fi
-    - name: Try again
-      run: |
-        read -r id st <<<"$(oci resource-manager job list --stack-id "$STACK" --sort-by timeCreated --sort-order DESC --limit 1 --query 'data[0].[id,"lifecycle-state"]|join(`" "`,@)' --raw-output)"
-        echo "Last job: ${st:-none}"
-        case "$st" in ACCEPTED|IN_PROGRESS|CANCELING) exit 0;; FAILED)
-          l=$(oci resource-manager job get-job-logs-content --job-id "$id" --query data --raw-output)
-          grep -qi "capacity\|TooManyRequests" <<<"$l" || { echo "::error::Non-capacity failure:"; grep -i error <<<"$l" | tail -5; exit 1; };; esac
-        oci resource-manager job create-apply-job --stack-id "$STACK" --execution-plan-strategy AUTO_APPROVED --query data.id --raw-output
+        end=$((SECONDS + 1500)); n=0
+        have_instance() {
+          c=$(oci compute instance list -c "$T" --all --display-name jellyfin --query "length(data[?\"lifecycle-state\"!='TERMINATED' && \"lifecycle-state\"!='TERMINATING'])" --raw-output 2>/dev/null)
+          [ "${c:-0}" -gt 0 ] 2>/dev/null
+        }
+        success() {
+          gh workflow disable "$GITHUB_WORKFLOW" -R "$GITHUB_REPOSITORY" || true
+          echo "::error::SUCCESS - Ampere instance exists! Workflow disabled."; exit 1
+        }
+        while [ "$SECONDS" -lt "$end" ]; do
+          have_instance && success
+          read -r id st <<<"$(oci resource-manager job list --stack-id "$STACK" --sort-by timeCreated --sort-order DESC --limit 1 --query 'data[0].[id,"lifecycle-state"]|join(`" "`,@)' --raw-output 2>/dev/null)"
+          case "$st" in
+            ACCEPTED|IN_PROGRESS|CANCELING) sleep 20; continue ;;
+            SUCCEEDED) sleep 30; have_instance && success ;;
+            FAILED)
+              l=$(oci resource-manager job get-job-logs-content --job-id "$id" --query data --raw-output 2>/dev/null)
+              if [ -z "$l" ]; then sleep 20; continue; fi
+              if ! grep -qi "capacity\|TooManyRequests" <<<"$l"; then
+                echo "::error::Last attempt failed for a reason other than capacity:"; grep -i error <<<"$l" | tail -5; exit 1
+              fi ;;
+          esac
+          n=$((n + 1)); echo "Attempt $n at $(date -u +%H:%M:%S) UTC"
+          if ! oci resource-manager job create-apply-job --stack-id "$STACK" --execution-plan-strategy AUTO_APPROVED --query data.id --raw-output; then
+            echo "::warning::Couldn't start a job (probably rate limited); waiting a minute"; sleep 60; continue
+          fi
+          sleep 30
+        done
+        echo "Made $n attempts this run - all out of capacity."
