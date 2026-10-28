@@ -1,6 +1,7 @@
-# Retries the jellyfin-ampere Oracle stack until the instance exists.
-# Each run stays alive ~25 min and starts a new attempt as soon as the previous
-# one finishes (~every 2 min). Secrets: OCI_USER, OCI_TENANCY, OCI_FINGERPRINT, OCI_KEY
+# Tries to launch the free Ampere "jellyfin" instance directly (compute API)
+# about once a minute until it succeeds. Settings (subnet, image, SSH key, AD)
+# are read from the saved jellyfin-ampere stack so they match what you set up.
+# Secrets: OCI_USER, OCI_TENANCY, OCI_FINGERPRINT, OCI_KEY
 name: OCI Ampere retry
 on:
   schedule: [{cron: "*/10 * * * *"}]
@@ -18,40 +19,68 @@ jobs:
       GH_TOKEN: ${{ github.token }}
     steps:
     - run: pip install -q oci-cli
-    - env: {U: "${{ secrets.OCI_USER }}", F: "${{ secrets.OCI_FINGERPRINT }}", K: "${{ secrets.OCI_KEY }}"}
+    - name: Oracle login
+      env: {U: "${{ secrets.OCI_USER }}", F: "${{ secrets.OCI_FINGERPRINT }}", K: "${{ secrets.OCI_KEY }}"}
       run: |
         mkdir -p ~/.oci; printf '%s\n' "$K" > ~/.oci/k.pem; chmod 600 ~/.oci/k.pem
         printf '[DEFAULT]\nuser=%s\nfingerprint=%s\ntenancy=%s\nregion=us-sanjose-1\nkey_file=%s\n' "$U" "$F" "$T" ~/.oci/k.pem > ~/.oci/config
         chmod 600 ~/.oci/config
         oci iam availability-domain list -c "$T" >/dev/null || { echo "::error::Oracle rejected the API key - check the 4 secrets"; exit 1; }
+    - name: Read settings from stack
+      run: |
+        mkdir -p tf
+        oci resource-manager stack get-stack-tf-config --stack-id "$STACK" --file tf.zip && unzip -o -q tf.zip -d tf || true
+        oci resource-manager stack get --stack-id "$STACK" > tf/stack.json || true
+        all=$(cat tf/* tf/*/* 2>/dev/null)
+        SSH=$(grep -oE 'ssh-(rsa|ed25519) [A-Za-z0-9+/=]+' <<<"$all" | head -1)
+        SUBNET=$(grep -oE 'ocid1\.subnet\.[a-z0-9.-]+' <<<"$all" | head -1)
+        IMAGE=$(grep -oE 'ocid1\.image\.[a-z0-9.-]+' <<<"$all" | head -1)
+        AD=$(grep -oE '[A-Za-z0-9]+:US-SANJOSE-1-AD-[0-9]' <<<"$all" | head -1)
+        [ -n "$AD" ] || AD=$(oci iam availability-domain list -c "$T" --query 'data[0].name' --raw-output)
+        if [ -z "$IMAGE" ]; then
+          IMAGE=$(oci compute image list -c "$T" --operating-system "Canonical Ubuntu" --operating-system-version "24.04" \
+                    --shape VM.Standard.A1.Flex --sort-by TIMECREATED --sort-order DESC --limit 1 --query 'data[0].id' --raw-output)
+        fi
+        if [ -z "$SUBNET" ]; then
+          VCN=$(oci network vcn list -c "$T" --display-name jellyfin-vcn --query 'data[0].id' --raw-output)
+          SUBNET=$(oci network subnet list -c "$T" --vcn-id "$VCN" --query "data[?\"prohibit-public-ip-on-vnic\"==\`false\`] | [0].id" --raw-output)
+        fi
+        echo "AD:     $AD"; echo "Subnet: $SUBNET"; echo "Image:  $IMAGE"; echo "SSH key: ${SSH:0:30}..."
+        for v in SSH SUBNET IMAGE AD; do
+          [ -n "${!v}" ] && [ "${!v}" != "null" ] || { echo "::error::Couldn't find $v in the stack settings"; exit 1; }
+          echo "$v=${!v}" >> "$GITHUB_ENV"
+        done
     - name: Keep trying (~25 min)
       run: |
         end=$((SECONDS + 1500)); n=0
+        meta=$(jq -nc --arg k "$SSH" '{ssh_authorized_keys: $k}')
         have_instance() {
           c=$(oci compute instance list -c "$T" --all --display-name jellyfin --query "length(data[?\"lifecycle-state\"!='TERMINATED' && \"lifecycle-state\"!='TERMINATING'])" --raw-output 2>/dev/null)
           [ "${c:-0}" -gt 0 ] 2>/dev/null
         }
         success() {
           gh workflow disable "$GITHUB_WORKFLOW" -R "$GITHUB_REPOSITORY" || true
-          echo "::error::SUCCESS - Ampere instance exists! Workflow disabled."; exit 1
+          echo "::error::SUCCESS - Ampere instance created! Workflow disabled. See Oracle > Compute > Instances."; exit 1
         }
+        have_instance && success
         while [ "$SECONDS" -lt "$end" ]; do
-          have_instance && success
-          read -r id st <<<"$(oci resource-manager job list --stack-id "$STACK" --sort-by timeCreated --sort-order DESC --limit 1 --query 'data[0].[id,"lifecycle-state"]|join(`" "`,@)' --raw-output 2>/dev/null)"
-          case "$st" in
-            ACCEPTED|IN_PROGRESS|CANCELING) sleep 20; continue ;;
-            SUCCEEDED) sleep 30; have_instance && success ;;
-            FAILED)
-              l=$(oci resource-manager job get-job-logs-content --job-id "$id" --query data --raw-output 2>/dev/null)
-              if [ -z "$l" ]; then sleep 20; continue; fi
-              if ! grep -qi "capacity\|TooManyRequests" <<<"$l"; then
-                echo "::error::Last attempt failed for a reason other than capacity:"; grep -i error <<<"$l" | tail -5; exit 1
-              fi ;;
-          esac
-          n=$((n + 1)); echo "Attempt $n at $(date -u +%H:%M:%S) UTC"
-          if ! oci resource-manager job create-apply-job --stack-id "$STACK" --execution-plan-strategy AUTO_APPROVED --query data.id --raw-output; then
-            echo "::warning::Couldn't start a job (probably rate limited); waiting a minute"; sleep 60; continue
+          n=$((n + 1))
+          out=$(oci compute instance launch --no-retry -c "$T" --availability-domain "$AD" \
+                  --display-name jellyfin --shape VM.Standard.A1.Flex \
+                  --shape-config '{"ocpus": 2, "memoryInGBs": 12}' \
+                  --subnet-id "$SUBNET" --assign-public-ip true \
+                  --image-id "$IMAGE" --boot-volume-size-in-gbs 100 \
+                  --metadata "$meta" --query 'data.id' --raw-output 2>&1)
+          if grep -q '^ocid1\.instance' <<<"$out"; then echo "Attempt $n: LAUNCHED $out"; success; fi
+          if grep -qi 'capacity' <<<"$out"; then
+            echo "Attempt $n at $(date -u +%H:%M:%S) UTC: out of capacity"; sleep 60
+          elif grep -qi 'TooManyRequests\|"status": 429' <<<"$out"; then
+            echo "Attempt $n: rate limited, waiting 3 min"; sleep 180
+          elif grep -qi '"status": 5[0-9][0-9]' <<<"$out"; then
+            echo "Attempt $n: temporary Oracle error, retrying"; sleep 60
+          else
+            echo "::error::Launch failed for a reason other than capacity:"; echo "$out" | tail -20; exit 1
           fi
-          sleep 30
         done
-        echo "Made $n attempts this run - all out of capacity."
+        have_instance && success
+        echo "Made $n launch attempts this run - all out of capacity."
