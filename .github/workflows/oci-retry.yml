@@ -28,10 +28,11 @@ jobs:
         oci iam availability-domain list -c "$T" >/dev/null || { echo "::error::Oracle rejected the API key - check the 4 secrets"; exit 1; }
     - name: Read settings from stack
       run: |
+        set +eo pipefail
         mkdir -p tf
         oci resource-manager stack get-stack-tf-config --stack-id "$STACK" --file tf.zip && unzip -o -q tf.zip -d tf || true
         oci resource-manager stack get --stack-id "$STACK" > tf/stack.json || true
-        all=$(cat tf/* tf/*/* 2>/dev/null)
+        all=$(find tf -type f -exec cat {} + 2>/dev/null)
         SSH=$(grep -oE 'ssh-(rsa|ed25519) [A-Za-z0-9+/=]+' <<<"$all" | head -1)
         SUBNET=$(grep -oE 'ocid1\.subnet\.[a-z0-9.-]+' <<<"$all" | head -1)
         IMAGE=$(grep -oE 'ocid1\.image\.[a-z0-9.-]+' <<<"$all" | head -1)
@@ -52,6 +53,7 @@ jobs:
         done
     - name: Keep trying (~25 min)
       run: |
+        set +eo pipefail
         end=$((SECONDS + 1500)); n=0
         meta=$(jq -nc --arg k "$SSH" '{ssh_authorized_keys: $k}')
         have_instance() {
